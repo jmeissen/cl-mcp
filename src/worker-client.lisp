@@ -512,8 +512,8 @@ Bounded by *SPAWN-FAILURE-STDERR-TIMEOUT* (wall clock) and
   "Trim and shorten a stderr capture for inclusion in an error message.
 Strips trailing whitespace and truncates with an ellipsis if the
 content was capped at *SPAWN-FAILURE-STDERR-MAX-CHARS*."
-  (let* ((trimmed (string-right-trim '(#\Newline #\Return #\Space #\Tab) raw))
-         (truncated-p (>= (length raw) *spawn-failure-stderr-max-chars*)))
+  (let ((trimmed (string-right-trim '(#\Newline #\Return #\Space #\Tab) raw))
+        (truncated-p (>= (length raw) *spawn-failure-stderr-max-chars*)))
     (if truncated-p
         (concatenate 'string trimmed " [...truncated]")
         trimmed)))

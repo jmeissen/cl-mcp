@@ -993,7 +993,8 @@ writes) rather than raw with-open-file."
     (let ((rel-path (format nil "tests/tmp/cl-mcp-fake-sbcl-~A.sh"
                             (sb-posix:getpid)))
           (marker "FAKE-SBCL-DIED: simulated load failure here"))
-      (let ((script-path (%write-fake-sbcl rel-path marker)))
+      (let* ((*project-root* (asdf:system-source-directory :cl-mcp))
+             (script-path (%write-fake-sbcl rel-path marker)))
         (unwind-protect
              (let ((cl-mcp/src/worker-client::*cached-sbcl-path* script-path)
                    (cl-mcp/src/worker-client::*cached-ros-path* script-path)
