@@ -936,3 +936,69 @@ Cleans up server and socket on exit."
                                 env))
                   "MCP_LOG_FILE is excluded (denylisted)")))
         (%restore-env "FAKE_API_KEY_FOR_TEST" prev-fake)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Worker SBCL launch args — sb-posix preload (regression for issue where
+;;; bare-SBCL worker FASL load failed because nothing in the worker's ASDF
+;;; dep graph pulled in sb-posix transitively)
+;;; ---------------------------------------------------------------------------
+
+(deftest worker-build-sbcl-args-requires-sb-posix
+  (testing "%build-sbcl-args injects --eval (require :sb-posix) before loading cl-mcp"
+    (let* ((args (cl-mcp/src/worker-client::%build-sbcl-args))
+           (require-pos
+             (position-if
+              (lambda (s)
+                (and (stringp s) (search "(require :sb-posix)" s)))
+              args))
+           (load-pos
+             (position-if
+              (lambda (s)
+                (and (stringp s)
+                     (search "(asdf:load-system :cl-mcp/src/worker/main)" s)))
+              args)))
+      (ok require-pos
+          "(require :sb-posix) appears in args")
+      (ok load-pos
+          "asdf:load-system call appears in args")
+      (ok (and require-pos load-pos (< require-pos load-pos))
+          "(require :sb-posix) is positioned before asdf:load-system"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn failure stderr capture — without this, "Worker closed stdout before
+;;; handshake" failures arrive with no diagnostic context.
+;;; ---------------------------------------------------------------------------
+
+(defun %write-fake-sbcl (path stderr-message)
+  "Write an executable shell script to PATH that prints STDERR-MESSAGE on
+stderr and exits 1.  Used to simulate a child process that dies before
+emitting a handshake."
+  (with-open-file (out path :direction :output
+                            :if-exists :supersede
+                            :if-does-not-exist :create)
+    (format out "#!/bin/sh~%")
+    (format out "printf '%s' ~S 1>&2~%" stderr-message)
+    (format out "exit 1~%"))
+  (sb-posix:chmod path #o755)
+  path)
+
+(deftest spawn-worker-includes-child-stderr-in-error
+  (testing "spawn-worker surfaces child stderr in WORKER-SPAWN-FAILED message"
+    (let ((script-path (format nil "/tmp/cl-mcp-fake-sbcl-~A.sh"
+                               (sb-posix:getpid)))
+          (marker "FAKE-SBCL-DIED: simulated load failure here"))
+      (unwind-protect
+          (progn
+            (%write-fake-sbcl script-path marker)
+            (let ((cl-mcp/src/worker-client::*cached-sbcl-path* script-path)
+                  (cl-mcp/src/worker-client::*cached-ros-path* script-path)
+                  (caught-message nil))
+              (handler-case (cl-mcp/src/worker-client:spawn-worker)
+                (worker-spawn-failed (c)
+                  (setf caught-message
+                        (cl-mcp/src/worker-client::worker-spawn-failed-message c))))
+              (ok caught-message
+                  "spawn signals WORKER-SPAWN-FAILED")
+              (ok (and caught-message (search marker caught-message))
+                  "error message includes child stderr marker")))
+        (ignore-errors (delete-file script-path))))))
