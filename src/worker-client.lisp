@@ -276,11 +276,19 @@ loaded in the current image, or NIL otherwise."
   "Build command-line arguments for spawning a worker via bare SBCL.
 Configures ASDF source registry to find cl-mcp, optionally loads
 Quicklisp setup.lisp if available, loads the worker system via ASDF,
-and calls the entry point."
+and calls the entry point.
+
+Pre-requires sb-posix because worker FASLs (log.fasl, worker/main.fasl)
+embed package-qualified references to sb-posix:getpid etc.  SBCL
+resolves those package names at FASL-load time, so the contrib must
+be present before any cl-mcp FASL is loaded.  cl-mcp.asd also issues
+this require, but doing it here guards against future changes that
+might bypass the .asd."
   (let ((source-dir (namestring (asdf:system-source-directory :cl-mcp)))
         (ql-setup (%quicklisp-setup-path)))
     (append
-     (list "--noinform" "--non-interactive")
+     (list "--noinform" "--non-interactive"
+           "--eval" "(require :sb-posix)")
      (when ql-setup
        (list "--load" ql-setup))
      (list
@@ -466,6 +474,50 @@ can clean it up."
   "Generate a random shared secret for worker TCP authentication."
   (generate-random-hex-string 32))
 
+(defparameter *spawn-failure-stderr-timeout* 2
+  "Seconds to wait while draining a failed worker's stderr before
+giving up.  The child is typically already dead (it closed stdout),
+so EOF arrives quickly; this bound only matters when the child is
+still alive but stuck pre-handshake.")
+
+(defparameter *spawn-failure-stderr-max-chars* 4096
+  "Cap on captured stderr bytes included in spawn-failure messages.
+Prevents a chatty child from blowing up log lines.")
+
+(defun %drain-stderr-for-failure (process)
+  "Read whatever the child has written to stderr without blocking
+indefinitely.  Returns a string (possibly empty).  Used only on
+the spawn-failure path; the normal-success path starts a long-running
+drain thread instead via %START-STDERR-DRAIN.
+
+Bounded by *SPAWN-FAILURE-STDERR-TIMEOUT* (wall clock) and
+*SPAWN-FAILURE-STDERR-MAX-CHARS* (output size)."
+  (let ((err (and process (ignore-errors (sb-ext:process-error process)))))
+    (unless (and err (open-stream-p err))
+      (return-from %drain-stderr-for-failure ""))
+    (let ((buf (make-array 1024 :element-type 'character
+                                :adjustable t :fill-pointer 0)))
+      (handler-case
+          (sb-ext:with-timeout *spawn-failure-stderr-timeout*
+            (loop for ch = (read-char err nil nil)
+                  while ch
+                  do (vector-push-extend ch buf)
+                  when (>= (length buf) *spawn-failure-stderr-max-chars*)
+                  do (return)))
+        (sb-ext:timeout () nil)
+        (error () nil))
+      (coerce buf 'simple-string))))
+
+(defun %trim-stderr-for-message (raw)
+  "Trim and shorten a stderr capture for inclusion in an error message.
+Strips trailing whitespace and truncates with an ellipsis if the
+content was capped at *SPAWN-FAILURE-STDERR-MAX-CHARS*."
+  (let* ((trimmed (string-right-trim '(#\Newline #\Return #\Space #\Tab) raw))
+         (truncated-p (>= (length raw) *spawn-failure-stderr-max-chars*)))
+    (if truncated-p
+        (concatenate 'string trimmed " [...truncated]")
+        trimmed)))
+
 (defun spawn-worker ()
   "Launch a worker child process and return a WORKER struct.
 The worker is launched via Roswell, reads its JSON handshake to
@@ -474,7 +526,9 @@ authenticates with a shared secret, and returns the worker in
 :standby state.
 
 Signals WORKER-SPAWN-FAILED if the process cannot be started,
-the handshake fails, or authentication is rejected."
+the handshake fails, or authentication is rejected.  On failure
+the child's stderr is drained (bounded) and appended to the error
+message so callers can see what actually went wrong in the child."
   (let ((id (%next-worker-id))
         (secret (%generate-worker-secret))
         (process nil)
@@ -523,24 +577,38 @@ the handshake fails, or authentication is rejected."
                          "pid" pid)
               worker)))
       (error (e)
-        ;; Clean up on failure
-        (when socket
-          (ignore-errors (usocket:socket-close socket)))
-        (when process
-          (ignore-errors
-            (when (sb-ext:process-alive-p process)
-              (sb-ext:process-kill process 15)
-              (sleep 0.5)
+        ;; Drain stderr BEFORE killing the process so we can report what
+        ;; the child actually printed (e.g. SBCL backtrace from a failed
+        ;; (asdf:load-system ...) eval).  Without this, callers only see
+        ;; the generic "Worker closed stdout before handshake".
+        (let* ((raw-stderr (%drain-stderr-for-failure process))
+               (child-stderr (%trim-stderr-for-message raw-stderr))
+               ;; Use the raw message (not princ-to-string) when E is
+               ;; already a worker-spawn-failed so we don't double-prefix
+               ;; "Failed to spawn worker: " when re-signaling below.
+               (base-message (if (typep e 'worker-spawn-failed)
+                                 (worker-spawn-failed-message e)
+                                 (princ-to-string e))))
+          (when socket
+            (ignore-errors (usocket:socket-close socket)))
+          (when process
+            (ignore-errors
               (when (sb-ext:process-alive-p process)
-                (sb-ext:process-kill process 9)))
-            (sb-ext:process-close process)))
-        (log-event :warn "worker.spawn.failed"
-                   "id" id
-                   "error" (princ-to-string e))
-        (if (typep e 'worker-spawn-failed)
-            (error e)
-            (error 'worker-spawn-failed
-                   :message (princ-to-string e)))))))
+                (sb-ext:process-kill process 15)
+                (sleep 0.5)
+                (when (sb-ext:process-alive-p process)
+                  (sb-ext:process-kill process 9)))
+              (sb-ext:process-close process)))
+          (apply #'log-event :warn "worker.spawn.failed"
+                 "id" id
+                 "error" base-message
+                 (when (plusp (length child-stderr))
+                   (list "child_stderr" child-stderr)))
+          (let ((enriched (if (plusp (length child-stderr))
+                              (format nil "~A; child stderr: ~A"
+                                      base-message child-stderr)
+                              base-message)))
+            (error 'worker-spawn-failed :message enriched)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Public API — RPC

@@ -1,5 +1,14 @@
 ;;;; cl-mcp.asd
 
+;; Pre-load SBCL contribs that source files reference via package-qualified
+;; symbols (sb-posix:getpid, sb-posix:sigterm, ...).  SBCL resolves package
+;; names embedded in FASLs at load time, before any top-level form in the
+;; FASL runs, so adding (require :sb-posix) inside a source file is too late.
+;; Putting it here guarantees the contrib is available before ASDF loads any
+;; cl-mcp FASL — including from the bare-SBCL worker, whose dep graph would
+;; not otherwise pull in sb-posix transitively (see %build-sbcl-args).
+#+sbcl (require :sb-posix)
+
 ;; Tell ASDF that eclector.parse-result package is provided by eclector
 (asdf:register-system-packages "eclector"
                                '(:eclector.parse-result

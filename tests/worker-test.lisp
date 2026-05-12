@@ -17,7 +17,11 @@
                 #:register-all-handlers)
   (:import-from #:cl-mcp/src/worker/main)
   (:import-from #:cl-mcp/src/worker-client
-                #:worker-spawn-failed))
+                #:worker-spawn-failed)
+  (:import-from #:cl-mcp/src/fs
+                #:fs-write-file)
+  (:import-from #:cl-mcp/src/project-root
+                #:*project-root*))
 
 (in-package #:cl-mcp/tests/worker-test)
 
@@ -936,3 +940,70 @@ Cleans up server and socket on exit."
                                 env))
                   "MCP_LOG_FILE is excluded (denylisted)")))
         (%restore-env "FAKE_API_KEY_FOR_TEST" prev-fake)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Worker SBCL launch args — sb-posix preload (regression for issue where
+;;; bare-SBCL worker FASL load failed because nothing in the worker's ASDF
+;;; dep graph pulled in sb-posix transitively)
+;;; ---------------------------------------------------------------------------
+
+(deftest worker-build-sbcl-args-requires-sb-posix
+  (testing "%build-sbcl-args injects --eval (require :sb-posix) before loading cl-mcp"
+    (let* ((args (cl-mcp/src/worker-client::%build-sbcl-args))
+           (require-pos
+             (position-if
+              (lambda (s)
+                (and (stringp s) (search "(require :sb-posix)" s)))
+              args))
+           (load-pos
+             (position-if
+              (lambda (s)
+                (and (stringp s)
+                     (search "(asdf:load-system :cl-mcp/src/worker/main)" s)))
+              args)))
+      (ok require-pos
+          "(require :sb-posix) appears in args")
+      (ok load-pos
+          "asdf:load-system call appears in args")
+      (ok (and require-pos load-pos (< require-pos load-pos))
+          "(require :sb-posix) is positioned before asdf:load-system"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Spawn failure stderr capture — without this, "Worker closed stdout before
+;;; handshake" failures arrive with no diagnostic context.
+;;; ---------------------------------------------------------------------------
+
+(defun %write-fake-sbcl (relative-path stderr-message)
+  "Write an executable shell script to RELATIVE-PATH (under project root)
+that prints STDERR-MESSAGE on stderr and exits 1.  Used to simulate a
+child process that dies before emitting a handshake.  Returns the
+absolute pathname namestring of the written script.
+
+Uses cl-mcp/src/fs:fs-write-file (required wrapper for filesystem
+writes) rather than raw with-open-file."
+  (let ((script (format nil "#!/bin/sh~%printf '%s' ~S 1>&2~%exit 1~%"
+                        stderr-message)))
+    (fs-write-file relative-path script)
+    (let ((abs (namestring (merge-pathnames relative-path *project-root*))))
+      (sb-posix:chmod abs #o755)
+      abs)))
+
+(deftest spawn-worker-includes-child-stderr-in-error
+  (testing "spawn-worker surfaces child stderr in WORKER-SPAWN-FAILED message"
+    (let ((rel-path (format nil "tests/tmp/cl-mcp-fake-sbcl-~A.sh"
+                            (sb-posix:getpid)))
+          (marker "FAKE-SBCL-DIED: simulated load failure here"))
+      (let ((script-path (%write-fake-sbcl rel-path marker)))
+        (unwind-protect
+             (let ((cl-mcp/src/worker-client::*cached-sbcl-path* script-path)
+                   (cl-mcp/src/worker-client::*cached-ros-path* script-path)
+                   (caught-message nil))
+               (handler-case (cl-mcp/src/worker-client:spawn-worker)
+                 (worker-spawn-failed (c)
+                   (setf caught-message
+                         (cl-mcp/src/worker-client::worker-spawn-failed-message c))))
+               (ok caught-message
+                   "spawn signals WORKER-SPAWN-FAILED")
+               (ok (and caught-message (search marker caught-message))
+                   "error message includes child stderr marker"))
+          (ignore-errors (delete-file script-path)))))))
